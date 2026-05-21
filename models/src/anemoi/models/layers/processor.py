@@ -11,6 +11,7 @@
 from abc import ABC
 from typing import Optional
 
+import torch
 from torch import Tensor
 from torch import nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import offload_wrapper
@@ -74,7 +75,12 @@ class BaseProcessor(nn.Module, ABC):
     def run_layers(self, data: tuple, *args, **kwargs) -> Tensor:
         """Run Layers with checkpoint."""
         for layer in self.proc:
-            data = checkpoint(layer, *data, *args, **kwargs, use_reentrant=False)
+            # Checkpointing is a training-memory optimization and introduces extra Python/graph overhead.
+            # During inference/eval with no grad, run layers directly.
+            if self.training and torch.is_grad_enabled():
+                data = checkpoint(layer, *data, *args, **kwargs, use_reentrant=False)
+            else:
+                data = layer(*data, *args, **kwargs)
         return data
 
     def forward(self, x: Tensor, *args, **kwargs) -> Tensor:

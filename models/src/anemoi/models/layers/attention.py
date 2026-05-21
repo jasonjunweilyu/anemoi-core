@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Optional
 
 import einops
@@ -34,6 +35,7 @@ class MultiHeadSelfAttention(nn.Module):
     allows for three different attention implementations:
     - scaled dot product attention, see https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
     - flash attention, see https://github.com/Dao-AILab/flash-attention
+    - flex attention, see https://pytorch.org/blog/flexattention/
     """
 
     def __init__(
@@ -122,6 +124,7 @@ class MultiHeadSelfAttention(nn.Module):
         attn_funcs = {
             "flash_attention": FlashAttentionWrapper,
             "scaled_dot_product_attention": SDPAAttentionWrapper,
+            "flex_attention": FlexAttentionWrapper,
         }
         assert (
             self.attention_implementation in attn_funcs
@@ -215,12 +218,12 @@ class SDPAAttentionWrapper(nn.Module):
         softcap=None,
         alibi_slopes=None,
     ):
-        if softcap is not None:
-            NotImplementedError(
+        if softcap is not None and softcap > 0:
+            raise NotImplementedError(
                 "Softcap not supported by Pytorchs SDPA. please switch to flash attention or disable softcap."
             )
         if alibi_slopes is not None:
-            NotImplementedError(
+            raise NotImplementedError(
                 "Alibi slopes not supported by Pytorchs SDPA. please switch to flash attention or disable alibi slopes."
             )
 
@@ -239,6 +242,177 @@ class SDPAAttentionWrapper(nn.Module):
                 dropout_p=dropout_p,
             )
 
+        return out
+
+
+class FlexAttentionWrapper(nn.Module):
+    """Wrapper for Pytorch flex attention."""
+
+    def __init__(self):
+        super().__init__()
+        self._init_attention_ops()
+        self.block_mask = None
+        self.mask_signature = None
+
+    def _init_attention_ops(self):
+        try:
+            from torch.nn.attention.flex_attention import create_block_mask
+            from torch.nn.attention.flex_attention import flex_attention
+        except ImportError as exc:
+            raise ImportError(
+                "Error: Flex attention is not available in this PyTorch installation. "
+                "Please use PyTorch with torch.nn.attention.flex_attention support."
+            ) from exc
+
+        self.eager_attention = flex_attention
+        self.attention = self.eager_attention
+        self._compile_fallback_done = False
+        # Only compile flex_attention if model-level compilation is NOT happening.
+        # When the model is compiled as a whole unit, individual attention layers should not
+        # also compile separately to avoid double-compilation overhead.
+        disable_attention_compile = os.environ.get("DISABLE_ATTENTION_COMPILE")
+        if hasattr(torch, "compile") and not disable_attention_compile:
+            compile_options = {"device": "CPU"}
+            try:
+                self.attention = torch.compile(
+                    flex_attention,
+                    backend="openvino",
+                    options=compile_options,
+                    dynamic=False,
+                )
+            except Exception as exc:  # pragma: no cover - compile availability is environment-dependent.
+                LOGGER.warning(
+                    "Unable to compile flex attention with OpenVINO backend. "
+                    f"Trying default torch.compile. Error: {exc}"
+                )
+                try:
+                    self.attention = torch.compile(flex_attention, dynamic=False)
+                except Exception as exc_default:  # pragma: no cover - compile availability is environment-dependent.
+                    LOGGER.warning(
+                        "Unable to compile flex attention with default backend. "
+                        f"Falling back to eager mode. Error: {exc_default}"
+                    )
+        self.create_block_mask = create_block_mask
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Runtime callables created/imported here are not reliably picklable.
+        state["attention"] = None
+        state["eager_attention"] = None
+        state["create_block_mask"] = None
+        state["block_mask"] = None
+        state["mask_signature"] = None
+        state["_compile_fallback_done"] = False
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._init_attention_ops()
+        self.block_mask = None
+        self.mask_signature = None
+
+    @staticmethod
+    def _build_mask_mod(causal: bool, window_size: Optional[int]):
+        if window_size is None and not causal:
+            return None
+
+        if causal and window_size is None:
+
+            def mask_mod(batch, head, q_idx, kv_idx):
+                return q_idx >= kv_idx
+
+            return mask_mod
+
+        if causal:
+
+            def mask_mod(batch, head, q_idx, kv_idx):
+                return (q_idx >= kv_idx) & ((q_idx - kv_idx) <= window_size)
+
+            return mask_mod
+
+        def mask_mod(batch, head, q_idx, kv_idx):
+            return torch.abs(q_idx - kv_idx) <= window_size
+
+        return mask_mod
+
+    def _update_block_mask(self, query: Tensor, key: Tensor, causal: bool, window_size: Optional[int]):
+        q_len = query.shape[-2]
+        kv_len = key.shape[-2]
+        batch_size = query.shape[0]
+        num_heads = query.shape[1]
+        signature = (q_len, kv_len, batch_size, num_heads, str(query.device), causal, window_size)
+
+        if self.mask_signature == signature:
+            return
+
+        mask_mod = self._build_mask_mod(causal=causal, window_size=window_size)
+        if mask_mod is None:
+            self.block_mask = None
+        else:
+            self.block_mask = self.create_block_mask(
+                mask_mod,
+                B=batch_size,
+                H=num_heads,
+                Q_LEN=q_len,
+                KV_LEN=kv_len,
+                device=query.device,
+            )
+        self.mask_signature = signature
+
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        batch_size: int,
+        causal: bool = False,
+        window_size: int = None,
+        dropout_p: float = 0.0,
+        softcap: Optional[float] = None,
+        alibi_slopes: torch.Tensor = None,
+    ):
+        if dropout_p > 0.0:
+            LOGGER.warning("Dropout is not currently supported by flex attention wrapper and will be ignored.")
+        if softcap is not None and softcap > 0:
+            raise NotImplementedError(
+                "Softcap is not supported by Pytorch flex_attention in this wrapper. "
+                "Please disable softcap or switch attention implementation."
+            )
+        if alibi_slopes is not None:
+            raise NotImplementedError(
+                "Alibi slopes are not supported by Pytorch flex_attention in this wrapper. "
+                "Please disable alibi slopes or switch attention implementation."
+            )
+
+        self._update_block_mask(query=query, key=key, causal=causal, window_size=window_size)
+
+        # OpenVINO/TorchDynamo can fail shape-guard creation on non-contiguous strided views.
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+
+        try:
+            out = self.attention(
+                query,
+                key,
+                value,
+                block_mask=self.block_mask,
+            )
+        except Exception as exc:  # pragma: no cover - depends on runtime compiler support.
+            if self.attention is not self.eager_attention and not self._compile_fallback_done:
+                LOGGER.warning(
+                    f"Compiled flex attention failed at runtime, falling back to eager mode. Error: {exc}"
+                )
+                self.attention = self.eager_attention
+                self._compile_fallback_done = True
+                out = self.attention(
+                    query,
+                    key,
+                    value,
+                    block_mask=self.block_mask,
+                )
+            else:
+                raise
         return out
 
 

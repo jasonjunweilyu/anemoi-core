@@ -108,3 +108,44 @@ def test_multi_head_self_attention_backward_sdpa(batch_size, num_heads, embed_di
 
     assert x.grad is not None
     assert x.grad.shape == x.shape
+
+
+def test_multi_head_self_attention_forward_flex_attention_window():
+    layer_kernels = instantiate(load_layer_kernels(kernel_config={}))
+    mhsa = MultiHeadSelfAttention(
+        num_heads=2,
+        embed_dim=8,
+        layer_kernels=layer_kernels,
+        dropout_p=0.0,
+        attention_implementation="flex_attention",
+        window_size=1,
+    )
+    mhsa.eval()
+
+    x = torch.randn(8, 8)
+    shapes = [list(x.shape)]
+    with torch.no_grad():
+        output = mhsa.forward(x, shapes, batch_size=2)
+
+    assert output.shape == x.shape
+
+
+def test_multi_head_self_attention_forward_flex_attention_softcap_zero():
+    layer_kernels = instantiate(load_layer_kernels(kernel_config={}))
+    mhsa = MultiHeadSelfAttention(
+        num_heads=2,
+        embed_dim=8,
+        layer_kernels=layer_kernels,
+        dropout_p=0.0,
+        attention_implementation="flex_attention",
+        window_size=1,
+        softcap=0.0,
+    )
+    mhsa.eval()
+
+    x = torch.randn(8, 8)
+    shapes = [list(x.shape)]
+    with torch.no_grad():
+        output = mhsa.forward(x, shapes, batch_size=2)
+
+    assert output.shape == x.shape
