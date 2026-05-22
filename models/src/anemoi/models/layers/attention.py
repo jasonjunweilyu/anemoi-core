@@ -232,7 +232,9 @@ class SDPAAttentionWrapper(nn.Module):
         if window_size is not None and (self.mask is None or tuple(self.mask.shape) != (sequence_len, sequence_len)):
             self.update_mask(sequence_len, window_size=window_size, device=query.device)
 
-        with torch.nn.attention.sdpa_kernel(backends=[torch.nn.attention.SDPBackend.MATH]):
+        # Let PyTorch choose the best available SDPA backend first.
+        # Fallback to MATH only if backend selection fails for this input.
+        try:
             out = self.attention(
                 query,
                 key,
@@ -241,6 +243,16 @@ class SDPAAttentionWrapper(nn.Module):
                 is_causal=causal,
                 dropout_p=dropout_p,
             )
+        except RuntimeError:
+            with torch.nn.attention.sdpa_kernel(backends=[torch.nn.attention.SDPBackend.MATH]):
+                out = self.attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=self.mask,
+                    is_causal=causal,
+                    dropout_p=dropout_p,
+                )
 
         return out
 
