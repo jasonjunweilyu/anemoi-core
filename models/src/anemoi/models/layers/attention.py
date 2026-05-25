@@ -29,6 +29,55 @@ from anemoi.utils.config import DotDict
 LOGGER = logging.getLogger(__name__)
 
 
+@torch._dynamo.disable
+def _attention_forward_no_dynamo(
+    module: "MultiHeadSelfAttention",
+    x: Tensor,
+    shapes: list,
+    batch_size: int,
+    model_comm_group: Optional[ProcessGroup] = None,
+) -> Tensor:
+    """Run attention forward eagerly to bypass TorchDynamo graph capture.
+
+    This is a targeted mitigation for known InternalTorchDynamoError issues in
+    symbolic shape guard generation on some CPU compile backends.
+    """
+    return module._forward_impl(x, shapes, batch_size, model_comm_group)
+
+
+@torch._dynamo.disable
+def _split_and_reshape_qkv_no_dynamo(
+    qkv: Tensor,
+    batch_size: int,
+    num_heads: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Chunk QKV and reshape outside Dynamo to avoid shape-sensitive guard issues.
+    
+    The problem appears to be in the symbolic shape tracing when PyTorch encounters
+    the chunk operation combined with einops rearrange on symbolic batch/grid dims.
+    """
+    query, key, value = qkv.chunk(3, -1)
+    query = einops.rearrange(
+        query,
+        "(batch grid) (heads vars) -> batch heads grid vars",
+        batch=batch_size,
+        heads=num_heads,
+    )
+    key = einops.rearrange(
+        key,
+        "(batch grid) (heads vars) -> batch heads grid vars",
+        batch=batch_size,
+        heads=num_heads,
+    )
+    value = einops.rearrange(
+        value,
+        "(batch grid) (heads vars) -> batch heads grid vars",
+        batch=batch_size,
+        heads=num_heads,
+    )
+    return query, key, value
+
+
 class MultiHeadSelfAttention(nn.Module):
     """Multi Head Self Attention Pytorch Layer
 
@@ -135,26 +184,37 @@ class MultiHeadSelfAttention(nn.Module):
         # initalise the attn func here
         self.attention = attn_funcs[self.attention_implementation]()
 
-    def forward(
+    def _forward_impl(
         self, x: Tensor, shapes: list, batch_size: int, model_comm_group: Optional[ProcessGroup] = None
     ) -> Tensor:
 
-        query, key, value = self.lin_qkv(x).chunk(3, -1)
+        qkv = self.lin_qkv(x)
 
         if model_comm_group:
             assert (
                 model_comm_group.size() == 1 or batch_size == 1
             ), "Only batch size of 1 is supported when model is sharded accross GPUs"
 
-        query, key, value = (
-            einops.rearrange(
-                t,
-                "(batch grid) (heads vars) -> batch heads grid vars",
-                batch=batch_size,
-                heads=self.num_heads,
-            )
-            for t in (query, key, value)
+        disable_dynamo_reshape_only = os.environ.get("ANEMOI_DISABLE_DYNAMO_ATTENTION_RESHAPE_ONLY", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
         )
+        if disable_dynamo_reshape_only:
+            # Use no-dynamo path for split + reshape (shape-sensitive), but keep rest of compute under dynamo
+            query, key, value = _split_and_reshape_qkv_no_dynamo(qkv, batch_size, self.num_heads)
+        else:
+            query, key, value = qkv.chunk(3, -1)
+            query, key, value = (
+                einops.rearrange(
+                    t,
+                    "(batch grid) (heads vars) -> batch heads grid vars",
+                    batch=batch_size,
+                    heads=self.num_heads,
+                )
+                for t in (query, key, value)
+            )
 
         query = shard_heads(query, shapes=shapes, mgroup=model_comm_group)
         key = shard_heads(key, shapes=shapes, mgroup=model_comm_group)
@@ -184,6 +244,19 @@ class MultiHeadSelfAttention(nn.Module):
 
         return out
 
+    def forward(
+        self, x: Tensor, shapes: list, batch_size: int, model_comm_group: Optional[ProcessGroup] = None
+    ) -> Tensor:
+        disable_dynamo_attention = os.environ.get("ANEMOI_DISABLE_DYNAMO_ATTENTION", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if disable_dynamo_attention:
+            return _attention_forward_no_dynamo(self, x, shapes, batch_size, model_comm_group)
+        return self._forward_impl(x, shapes, batch_size, model_comm_group)
+
 
 class SDPAAttentionWrapper(nn.Module):
     """Wrapper for Pytorch scaled dot product attention"""
@@ -196,6 +269,8 @@ class SDPAAttentionWrapper(nn.Module):
         self.attention = scaled_dot_product_attention
         self.mask = None
         self.window_size = None
+        self._backend_log_done = False
+        self._math_fallback_logged = False
 
     def update_mask(self, seq_len, window_size: int, device: str):
 
@@ -232,8 +307,76 @@ class SDPAAttentionWrapper(nn.Module):
         if window_size is not None and (self.mask is None or tuple(self.mask.shape) != (sequence_len, sequence_len)):
             self.update_mask(sequence_len, window_size=window_size, device=query.device)
 
+        # Older pickled checkpoints may restore module state without newly-added attrs.
+        if not hasattr(self, "_backend_log_done"):
+            self._backend_log_done = False
+        if not hasattr(self, "_math_fallback_logged"):
+            self._math_fallback_logged = False
+
+        if not self._backend_log_done:
+            policy = os.environ.get("ANEMOI_SDPA_BACKEND", "auto").lower()
+            allowed = "unknown"
+            try:
+                # Internal API, but useful for runtime diagnostics.
+                allowed = str(torch.nn.attention._cur_sdpa_kernel_backends())
+            except Exception:
+                pass
+            LOGGER.info(
+                "SDPA runtime policy=%s, allowed_backends=%s, device=%s, dtype=%s",
+                policy,
+                allowed,
+                query.device,
+                query.dtype,
+            )
+            self._backend_log_done = True
+
         # Let PyTorch choose the best available SDPA backend first.
-        # Fallback to MATH only if backend selection fails for this input.
+        # ANEMOI_SDPA_BACKEND may force a specific backend for controlled benchmarking.
+        policy = os.environ.get("ANEMOI_SDPA_BACKEND", "auto").lower()
+        backend_map = {
+            "math": torch.nn.attention.SDPBackend.MATH,
+            "flash": torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+            "flash_attention": torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+            "efficient": torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+            "efficient_attention": torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+            "cudnn": torch.nn.attention.SDPBackend.CUDNN_ATTENTION,
+            "cudnn_attention": torch.nn.attention.SDPBackend.CUDNN_ATTENTION,
+            "overrideable": torch.nn.attention.SDPBackend.OVERRIDEABLE,
+        }
+
+        if policy != "auto" and policy in backend_map:
+            forced_backend = backend_map[policy]
+            try:
+                with torch.nn.attention.sdpa_kernel(backends=[forced_backend]):
+                    return self.attention(
+                        query,
+                        key,
+                        value,
+                        attn_mask=self.mask,
+                        is_causal=causal,
+                        dropout_p=dropout_p,
+                    )
+            except RuntimeError:
+                if not self._math_fallback_logged:
+                    LOGGER.warning(
+                        "SDPA forced backend=%s failed at runtime, falling back to MATH backend",
+                        policy,
+                    )
+                    self._math_fallback_logged = True
+                with torch.nn.attention.sdpa_kernel(backends=[torch.nn.attention.SDPBackend.MATH]):
+                    return self.attention(
+                        query,
+                        key,
+                        value,
+                        attn_mask=self.mask,
+                        is_causal=causal,
+                        dropout_p=dropout_p,
+                    )
+
+        if policy != "auto" and policy not in backend_map and not self._math_fallback_logged:
+            LOGGER.warning("Unknown ANEMOI_SDPA_BACKEND policy=%s, using auto selection", policy)
+            self._math_fallback_logged = True
+
         try:
             out = self.attention(
                 query,
@@ -244,6 +387,9 @@ class SDPAAttentionWrapper(nn.Module):
                 dropout_p=dropout_p,
             )
         except RuntimeError:
+            if not self._math_fallback_logged:
+                LOGGER.warning("SDPA auto backend failed at runtime, falling back to MATH backend")
+                self._math_fallback_logged = True
             with torch.nn.attention.sdpa_kernel(backends=[torch.nn.attention.SDPBackend.MATH]):
                 out = self.attention(
                     query,

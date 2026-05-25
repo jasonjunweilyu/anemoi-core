@@ -10,6 +10,8 @@
 
 import logging
 import os
+import atexit
+import time
 from abc import ABC
 from abc import abstractmethod
 from typing import Optional
@@ -36,6 +38,44 @@ from anemoi.models.layers.mlp import MLP
 from anemoi.utils.config import DotDict
 
 LOGGER = logging.getLogger(__name__)
+
+
+_ENABLE_BLOCK_TIMING = os.environ.get("ANEMOI_PROFILE_BLOCK_TIMINGS", "0").lower() in ("1", "true", "yes", "on")
+_BLOCK_TIMINGS = {
+    "layer_norm_attention": 0.0,
+    "attention": 0.0,
+    "layer_norm_mlp": 0.0,
+    "mlp": 0.0,
+    "calls": 0,
+}
+
+
+def _log_block_timing_summary() -> None:
+    if not _ENABLE_BLOCK_TIMING:
+        return
+    total = (
+        _BLOCK_TIMINGS["layer_norm_attention"]
+        + _BLOCK_TIMINGS["attention"]
+        + _BLOCK_TIMINGS["layer_norm_mlp"]
+        + _BLOCK_TIMINGS["mlp"]
+    )
+    if total <= 0:
+        return
+    LOGGER.info(
+        "block_hotspot_summary calls=%d layer_norm_attention_ms=%.3f(%.2f%%) attention_ms=%.3f(%.2f%%) layer_norm_mlp_ms=%.3f(%.2f%%) mlp_ms=%.3f(%.2f%%)",
+        _BLOCK_TIMINGS["calls"],
+        _BLOCK_TIMINGS["layer_norm_attention"] * 1000.0,
+        (_BLOCK_TIMINGS["layer_norm_attention"] / total) * 100.0,
+        _BLOCK_TIMINGS["attention"] * 1000.0,
+        (_BLOCK_TIMINGS["attention"] / total) * 100.0,
+        _BLOCK_TIMINGS["layer_norm_mlp"] * 1000.0,
+        (_BLOCK_TIMINGS["layer_norm_mlp"] / total) * 100.0,
+        _BLOCK_TIMINGS["mlp"] * 1000.0,
+        (_BLOCK_TIMINGS["mlp"] / total) * 100.0,
+    )
+
+
+atexit.register(_log_block_timing_summary)
 
 # Number of chunks used in inference (https://github.com/ecmwf/anemoi-models/pull/46)
 NUM_CHUNKS_INFERENCE = int(os.environ.get("ANEMOI_INFERENCE_NUM_CHUNKS", "1"))
@@ -119,15 +159,34 @@ class TransformerProcessorBlock(BaseBlock):
         model_comm_group: Optional[ProcessGroup] = None,
         **layer_kwargs,
     ) -> Tensor:
-        x = x + self.attention(
-            self.layer_norm_attention(x, **layer_kwargs), shapes, batch_size, model_comm_group=model_comm_group
-        )
-        x = x + self.mlp(
-            self.layer_norm_mlp(
-                x,
-                **layer_kwargs,
+        if _ENABLE_BLOCK_TIMING:
+            t0 = time.perf_counter()
+            x_attn_norm = self.layer_norm_attention(x, **layer_kwargs)
+            t1 = time.perf_counter()
+            x_attn = self.attention(x_attn_norm, shapes, batch_size, model_comm_group=model_comm_group)
+            t2 = time.perf_counter()
+            x = x + x_attn
+            x_mlp_norm = self.layer_norm_mlp(x, **layer_kwargs)
+            t3 = time.perf_counter()
+            x_mlp = self.mlp(x_mlp_norm)
+            t4 = time.perf_counter()
+            x = x + x_mlp
+
+            _BLOCK_TIMINGS["layer_norm_attention"] += t1 - t0
+            _BLOCK_TIMINGS["attention"] += t2 - t1
+            _BLOCK_TIMINGS["layer_norm_mlp"] += t3 - t2
+            _BLOCK_TIMINGS["mlp"] += t4 - t3
+            _BLOCK_TIMINGS["calls"] += 1
+        else:
+            x = x + self.attention(
+                self.layer_norm_attention(x, **layer_kwargs), shapes, batch_size, model_comm_group=model_comm_group
             )
-        )
+            x = x + self.mlp(
+                self.layer_norm_mlp(
+                    x,
+                    **layer_kwargs,
+                )
+            )
         return x
 
 
